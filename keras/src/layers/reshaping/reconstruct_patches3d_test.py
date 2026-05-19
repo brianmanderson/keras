@@ -69,13 +69,73 @@ class ReconstructPatches3DTest(testing.TestCase):
                 size=(2, 2, 2), output_size=(8, 8, 8), padding="reflect",
             )
 
-    def test_strides_overlap_not_implemented(self):
-        x = _gradient_volume(16, 16, 16, 1, batch=1)
-        patches = ops.image.extract_patches(
-            ops.convert_to_tensor(x), size=(4, 4, 4), padding="valid",
-        )
-        with self.assertRaisesRegex(NotImplementedError, "non-overlapping"):
+    def test_gapped_strides_rejected(self):
+        """strides > size leaves gaps in coverage; cannot be inverted."""
+        with self.assertRaisesRegex(NotImplementedError, "gapped"):
             layers.ReconstructPatches3D(
-                size=(4, 4, 4), output_size=(16, 16, 16),
-                strides=(2, 2, 2), padding="valid",
-            )(patches)
+                size=(4, 4, 4), output_size=(32, 32, 32),
+                strides=(8, 8, 8), padding="valid",
+            )
+
+    def test_overlapping_strides_supported(self):
+        """strides < size now works via the conv-transpose path."""
+        x = _gradient_volume(16, 16, 16, 1, batch=1)
+        x_t = ops.convert_to_tensor(x)
+        patches = ops.image.extract_patches(
+            x_t, size=(4, 4, 4), strides=2, padding="valid",
+        )
+        recon = layers.ReconstructPatches3D(
+            size=(4, 4, 4), output_size=(16, 16, 16),
+            strides=(2, 2, 2), padding="valid",
+        )(patches)
+        self.assertAllClose(recon, x, atol=1e-5)
+
+    @pytest.mark.skipif(
+        backend.backend() == "tensorflow",
+        reason="extract_patches with channels_first requires NCHW conv which "
+               "is unavailable on tensorflow-cpu.",
+    )
+    def test_channels_first_roundtrip(self):
+        x = np.random.RandomState(0).rand(1, 2, 8, 16, 16).astype("float32")
+        x_t = ops.convert_to_tensor(x)
+        patches = ops.image.extract_patches(
+            x_t, size=(4, 4, 4), padding="valid", data_format="channels_first",
+        )
+        recon = layers.ReconstructPatches3D(
+            size=(4, 4, 4), output_size=(8, 16, 16), padding="valid",
+            data_format="channels_first",
+        )(patches)
+        self.assertEqual(tuple(recon.shape), x.shape)
+        self.assertAllClose(recon, x, atol=1e-6)
+
+    def test_dual_input_dynamic_output_size(self):
+        """[patches, reference] mode: output_size derived from reference."""
+        x = np.random.RandomState(1).rand(1, 9, 17, 19, 2).astype("float32")
+        x_t = ops.convert_to_tensor(x)
+        patches = ops.image.extract_patches(x_t, size=(4, 4, 4), padding="same")
+        # No output_size in __init__
+        layer = layers.ReconstructPatches3D(size=(4, 4, 4), padding="same")
+        recon = layer([patches, x_t])
+        self.assertAllClose(recon, x, atol=1e-6)
+
+    def test_reduction_sum_overshoots_at_overlap(self):
+        """reduction='sum' should overshoot 1.0 where patches overlap."""
+        x = np.ones((1, 16, 16, 16, 1), dtype="float32")
+        x_t = ops.convert_to_tensor(x)
+        patches = ops.image.extract_patches(
+            x_t, size=(4, 4, 4), strides=2, padding="valid",
+        )
+        recon_sum = layers.ReconstructPatches3D(
+            size=(4, 4, 4), output_size=(16, 16, 16),
+            strides=(2, 2, 2), padding="valid", reduction="sum",
+        )(patches)
+        self.assertGreater(float(ops.max(recon_sum)), 1.5)
+
+    def test_auto_infer_output_size_valid(self):
+        """output_size=None with valid padding is inferred from patches."""
+        x = np.random.RandomState(2).rand(1, 8, 16, 16, 2).astype("float32")
+        x_t = ops.convert_to_tensor(x)
+        patches = ops.image.extract_patches(x_t, size=(4, 4, 4), padding="valid")
+        layer = layers.ReconstructPatches3D(size=(4, 4, 4), padding="valid")
+        recon = layer(patches)
+        self.assertAllClose(recon, x, atol=1e-6)

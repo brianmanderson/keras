@@ -932,10 +932,12 @@ class ReconstructPatches(Operation):
     def __init__(
         self,
         size,
-        output_size,
+        output_size=None,
         strides=None,
         padding="valid",
         data_format=None,
+        reduction="mean",
+        dilation_rate=1,
         *,
         name=None,
     ):
@@ -943,7 +945,7 @@ class ReconstructPatches(Operation):
         if isinstance(size, int):
             size = (size, size)
         self.size = tuple(size)
-        self.output_size = tuple(output_size)
+        self.output_size = tuple(output_size) if output_size is not None else None
         self.is_3d = len(self.size) == 3
         if strides is None:
             strides = self.size
@@ -952,6 +954,8 @@ class ReconstructPatches(Operation):
         self.strides = tuple(strides)
         self.padding = padding
         self.data_format = backend.standardize_data_format(data_format)
+        self.reduction = reduction
+        self.dilation_rate = dilation_rate
 
     def call(self, patches):
         return _reconstruct_patches(
@@ -961,6 +965,8 @@ class ReconstructPatches(Operation):
             strides=self.strides,
             padding=self.padding,
             data_format=self.data_format,
+            reduction=self.reduction,
+            dilation_rate=self.dilation_rate,
         )
 
     def compute_output_spec(self, patches):
@@ -977,11 +983,9 @@ class ReconstructPatches(Operation):
         if self.is_3d:
             expected_ndim_batched = 5
             expected_ndim_unbatched = 4
-            spatial = self.output_size  # (D, H, W)
         else:
             expected_ndim_batched = 4
             expected_ndim_unbatched = 3
-            spatial = self.output_size  # (H, W)
 
         if original_ndim == expected_ndim_batched:
             batch = patches_shape[0]
@@ -995,6 +999,25 @@ class ReconstructPatches(Operation):
                 f"{expected_ndim_batched} (batched). "
                 f"Received shape: {patches.shape}"
             )
+
+        # Resolve output_size (auto-infer for valid padding when not given).
+        if self.output_size is not None:
+            spatial = self.output_size
+        elif self.padding == "valid":
+            if self.data_format == "channels_last":
+                grid_start = 1 if original_ndim == expected_ndim_batched else 0
+            else:
+                grid_start = 2 if original_ndim == expected_ndim_batched else 1
+            grid = patches_shape[grid_start:grid_start + len(self.size)]
+            if any(g is None for g in grid):
+                spatial = tuple([None] * len(self.size))
+            else:
+                spatial = tuple(
+                    (g - 1) * s + k
+                    for g, s, k in zip(grid, self.strides, self.size)
+                )
+        else:
+            spatial = tuple([None] * len(self.size))
 
         if self.data_format == "channels_last":
             out_shape = list(spatial) + [channels_out]
@@ -1012,6 +1035,8 @@ class ReconstructPatches(Operation):
             "strides": self.strides,
             "padding": self.padding,
             "data_format": self.data_format,
+            "reduction": self.reduction,
+            "dilation_rate": self.dilation_rate,
         }
 
 
@@ -1019,34 +1044,55 @@ class ReconstructPatches(Operation):
 def reconstruct_patches(
     patches,
     size,
-    output_size,
+    output_size=None,
     strides=None,
     padding="valid",
     data_format=None,
+    reduction="mean",
+    dilation_rate=1,
 ):
-    """Reconstructs image(s) or volume(s) from non-overlapping patches.
+    """Reconstructs image(s) or volume(s) from patches.
 
-    Inverse of `keras.ops.image.extract_patches` for the non-overlapping case
-    (`strides == size`).
+    Inverse of `keras.ops.image.extract_patches`. Supports non-overlapping
+    (`strides == size`, fast reshape path), overlapping (`strides < size`,
+    conv-transpose path with averaging), `channels_last` and `channels_first`
+    data formats, `"valid"` and `"same"` padding, and optional dilation.
+    For overlapping patches, contributions are summed and (when
+    `reduction="mean"`, the default) divided by per-pixel overlap count.
+    With `reduction="mean"`, the original is exactly recovered when patches
+    were extracted from a consistent input. With `reduction="sum"`, the
+    output matches `torch.nn.Fold` semantics.
 
     Args:
         patches: Patches tensor as produced by `extract_patches`.
             For 2D patches: 3D `(gH, gW, pH*pW*C)` or
-            4D `(N, gH, gW, pH*pW*C)`.
+            4D `(N, gH, gW, pH*pW*C)` (channels_last);
+            4D `(N, pH*pW*C, gH, gW)` (channels_first).
             For 3D patches: 4D `(gD, gH, gW, pD*pH*pW*C)` or
-            5D `(N, gD, gH, gW, pD*pH*pW*C)`.
+            5D `(N, gD, gH, gW, pD*pH*pW*C)` (channels_last);
+            5D `(N, pD*pH*pW*C, gD, gH, gW)` (channels_first).
         size: Patch size, matching the `size` used for extraction.
             Length 2 tuple for 2D, length 3 tuple for 3D, or int.
         output_size: Spatial shape of the original image/volume before
             extraction. Length 2 tuple `(H, W)` for 2D, length 3 tuple
-            `(D, H, W)` for 3D. Required so that `"same"` padding can be
-            unambiguously inverted.
-        strides: Currently must equal `size` (non-overlapping). Defaults
-            to `size`.
+            `(D, H, W)` for 3D. Optional when `padding="valid"` — the
+            output shape is then inferred from `patches` and `strides`.
+            Required for `padding="same"` because the original spatial
+            extent is ambiguous from patches alone.
+        strides: int or tuple. Must satisfy `strides <= size` on every
+            axis (gapped patches cannot be inverted). Defaults to `size`
+            (non-overlapping).
         padding: `"same"` or `"valid"`, matching the extraction.
         data_format: A string specifying the data format of the input tensor.
             It can be either `"channels_last"` or `"channels_first"`.
             If not specified, defaults to `keras.config.image_data_format`.
+        reduction: `"mean"` (default) or `"sum"`. How overlapping
+            contributions are combined. `"mean"` recovers the original
+            input; `"sum"` matches PyTorch `torch.nn.Fold` semantics.
+            Ignored when patches do not overlap.
+        dilation_rate: int or tuple. Dilation of the patch kernel,
+            matching the rate used at extraction. Only meaningful with
+            `strides == 1` (overlap path).
 
     Returns:
         Reconstructed image/volume:
@@ -1076,6 +1122,10 @@ def reconstruct_patches(
                 "Invalid `size` argument. Expected a tuple of length 2 or 3. "
                 f"Received: size={size} with length {len(size)}"
             )
+    if reduction not in ("mean", "sum"):
+        raise ValueError(
+            f"`reduction` must be 'mean' or 'sum'. Received: {reduction}"
+        )
 
     if any_symbolic_tensors((patches,)):
         return ReconstructPatches(
@@ -1084,10 +1134,14 @@ def reconstruct_patches(
             strides=strides,
             padding=padding,
             data_format=data_format,
+            reduction=reduction,
+            dilation_rate=dilation_rate,
         ).symbolic_call(patches)
 
     return _reconstruct_patches(
-        patches, size, output_size, strides, padding, data_format=data_format,
+        patches, size, output_size, strides, padding,
+        data_format=data_format, reduction=reduction,
+        dilation_rate=dilation_rate,
     )
 
 
@@ -1095,28 +1149,18 @@ def reconstruct_patches(
 def reconstruct_patches_3d(
     patches,
     size,
-    output_size,
+    output_size=None,
     strides=None,
     padding="valid",
     data_format=None,
+    reduction="mean",
+    dilation_rate=1,
 ):
-    """Reconstructs volume(s) from non-overlapping 3D patches.
+    """Reconstructs volume(s) from 3D patches.
 
-    Inverse of `keras.ops.image.extract_patches_3d`.
-
-    Args:
-        patches: Input patches. Must be 4D `(gD, gH, gW, pD*pH*pW*C)`
-            (unbatched) or 5D `(N, gD, gH, gW, pD*pH*pW*C)` (batched).
-        size: int or tuple `(patch_depth, patch_height, patch_width)`,
-            matching the `size` used for extraction.
-        output_size: tuple `(D, H, W)` — the original spatial shape before
-            extraction.
-        strides: Currently must equal `size`. Defaults to `size`.
-        padding: `"same"` or `"valid"`, matching the extraction.
-        data_format: `"channels_last"` or `"channels_first"`.
-
-    Returns:
-        Reconstructed volume, 4D (if not batched) or 5D (if batched).
+    Inverse of `keras.ops.image.extract_patches_3d`. See
+    `reconstruct_patches` for full argument documentation; this is the
+    explicit 3D entry point.
 
     Examples:
 
@@ -1130,6 +1174,10 @@ def reconstruct_patches_3d(
     """
     if isinstance(size, int):
         size = (size, size, size)
+    if reduction not in ("mean", "sum"):
+        raise ValueError(
+            f"`reduction` must be 'mean' or 'sum'. Received: {reduction}"
+        )
     if any_symbolic_tensors((patches,)):
         return ReconstructPatches(
             size=size,
@@ -1137,41 +1185,86 @@ def reconstruct_patches_3d(
             strides=strides,
             padding=padding,
             data_format=data_format,
+            reduction=reduction,
+            dilation_rate=dilation_rate,
         ).symbolic_call(patches)
     return _reconstruct_patches_3d(
-        patches, size, output_size, strides, padding, data_format=data_format,
+        patches, size, output_size, strides, padding,
+        data_format=data_format, reduction=reduction,
+        dilation_rate=dilation_rate,
     )
 
 
 def _reconstruct_patches(
-    patches, size, output_size, strides=None, padding="valid", data_format=None,
+    patches, size, output_size, strides=None, padding="valid",
+    data_format=None, reduction="mean", dilation_rate=1,
 ):
     if not isinstance(size, int) and len(size) == 3:
         return _reconstruct_patches_3d(
             patches, size, output_size, strides, padding, data_format,
+            reduction, dilation_rate,
         )
     return _reconstruct_patches_2d(
         patches, size, output_size, strides, padding, data_format,
+        reduction, dilation_rate,
     )
 
 
-def _validate_reconstruct_strides(size, strides, fn_name):
+def _normalize_strides(strides, size, fn_name):
+    """Default strides to size; reject gapped (stride > size on any axis)."""
     if strides is None:
         return tuple(size)
     if isinstance(strides, int):
         strides = (strides,) * len(size)
-    if tuple(strides) != tuple(size):
-        raise NotImplementedError(
-            f"`{fn_name}` currently supports only non-overlapping "
-            f"reconstruction (strides == size). Got strides={strides} "
-            f"and size={size}. Overlap-add reconstruction is planned for "
-            f"a follow-up."
+    strides = tuple(strides)
+    if len(strides) != len(size):
+        raise ValueError(
+            f"`strides` must have the same length as `size`. "
+            f"Got strides={strides}, size={size}"
         )
-    return tuple(strides)
+    for s, k in zip(strides, size):
+        if s > k:
+            raise NotImplementedError(
+                f"`{fn_name}` does not support gapped patches "
+                f"(stride > size). Got strides={strides}, size={size}. "
+                f"With stride > size, information between patches is lost "
+                f"and cannot be recovered."
+            )
+        if s < 1:
+            raise ValueError(
+                f"`strides` entries must be >= 1. Got strides={strides}"
+            )
+    return strides
+
+
+def _is_nonoverlapping(strides, size):
+    return tuple(strides) == tuple(size)
+
+
+def _infer_output_size_valid(patches, size, strides, data_format):
+    """Compute output_size from patches shape for padding='valid'."""
+    is_3d = (len(size) == 3)
+    rank = len(patches.shape)
+    if data_format == "channels_last":
+        first_grid_axis = 0 if rank == len(size) + 1 else 1
+        grid = patches.shape[first_grid_axis:first_grid_axis + len(size)]
+    else:
+        first_grid_axis = 1 if rank == len(size) + 1 else 2
+        grid = patches.shape[first_grid_axis:first_grid_axis + len(size)]
+    if any(g is None for g in grid):
+        raise ValueError(
+            f"Cannot auto-infer output_size for valid padding: at least one "
+            f"grid dimension is unknown. patches.shape={patches.shape}. "
+            f"Pass output_size explicitly."
+        )
+    return tuple(
+        (g - 1) * s + k for g, s, k in zip(grid, strides, size)
+    )
 
 
 def _reconstruct_patches_2d(
-    patches, size, output_size, strides=None, padding="valid", data_format=None,
+    patches, size, output_size, strides=None, padding="valid",
+    data_format=None, reduction="mean", dilation_rate=1,
 ):
     if isinstance(size, int):
         size = (size, size)
@@ -1180,29 +1273,75 @@ def _reconstruct_patches_2d(
             "Invalid `size`. Expected length 2 for 2D reconstruction. "
             f"Got: size={size}"
         )
+    if padding not in ("same", "valid"):
+        raise ValueError(
+            f"Invalid `padding`. Expected 'same' or 'valid'. Got: {padding}"
+        )
+    strides = _normalize_strides(strides, size, "reconstruct_patches")
+    if output_size is None:
+        if padding != "valid":
+            raise ValueError(
+                "`output_size=None` (auto-infer) is only supported for "
+                "padding='valid'. For padding='same', the original size is "
+                "ambiguous from patches alone — please pass output_size "
+                "explicitly."
+            )
+        output_size = _infer_output_size_valid(
+            patches, size, strides,
+            backend.standardize_data_format(data_format),
+        )
     if len(output_size) != 2:
         raise ValueError(
             "Invalid `output_size`. Expected length 2 (H, W). "
             f"Got: output_size={output_size}"
         )
-    if padding not in ("same", "valid"):
-        raise ValueError(
-            f"Invalid `padding`. Expected 'same' or 'valid'. Got: {padding}"
-        )
-    _validate_reconstruct_strides(size, strides, "reconstruct_patches")
     data_format = backend.standardize_data_format(data_format)
+
     if data_format == "channels_first":
-        raise NotImplementedError(
-            "reconstruct_patches does not yet support channels_first."
+        if len(patches.shape) == 3:    # unbatched (flat, gH, gW)
+            patches_cl = backend.numpy.transpose(patches, axes=(1, 2, 0))
+        elif len(patches.shape) == 4:  # batched (B, flat, gH, gW)
+            patches_cl = backend.numpy.transpose(patches, axes=(0, 2, 3, 1))
+        else:
+            raise ValueError(
+                f"`patches` has unexpected rank for 2D channels_first: "
+                f"got shape {patches.shape}"
+            )
+        result_cl = _reconstruct_patches_2d_cl(
+            patches_cl, size, output_size, strides, padding, reduction,
+            dilation_rate,
+        )
+        if len(patches.shape) == 3:
+            return backend.numpy.transpose(result_cl, axes=(2, 0, 1))
+        return backend.numpy.transpose(result_cl, axes=(0, 3, 1, 2))
+
+    return _reconstruct_patches_2d_cl(
+        patches, size, output_size, strides, padding, reduction, dilation_rate,
+    )
+
+
+def _reconstruct_patches_2d_cl(
+    patches, size, output_size, strides, padding, reduction, dilation_rate=1,
+):
+    _unbatched = (len(patches.shape) == 3)
+    if _unbatched:
+        patches = backend.numpy.expand_dims(patches, axis=0)
+
+    if _is_nonoverlapping(strides, size) and dilation_rate == 1:
+        result = _reconstruct_2d_nonoverlap_cl(patches, size, output_size, padding)
+    else:
+        result = _reconstruct_2d_overlap_cl(
+            patches, size, output_size, strides, padding, reduction, dilation_rate,
         )
 
+    if _unbatched:
+        result = backend.numpy.squeeze(result, axis=0)
+    return result
+
+
+def _reconstruct_2d_nonoverlap_cl(patches, size, output_size, padding):
     pH, pW = size
     H, W = output_size
-
-    _unbatched = False
-    if len(patches.shape) == 3:
-        _unbatched = True
-        patches = backend.numpy.expand_dims(patches, axis=0)
 
     shp = ops.shape(patches)
     B, gH, gW = shp[0], shp[1], shp[2]
@@ -1231,17 +1370,115 @@ def _reconstruct_patches_2d(
         if gH * pH != H or gW * pW != W:
             raise ValueError(
                 f"`padding='valid'` requires output_size to equal "
-                f"size * grid. Got output_size=({H},{W}), "
-                f"grid=({gH},{gW}), size=({pH},{pW})."
+                f"size * grid. Got output_size=({H},{W}); for grid=({gH},{gW}) "
+                f"and size=({pH},{pW}) expected output_size=({gH*pH},{gW*pW})."
             )
-
-    if _unbatched:
-        x = backend.numpy.squeeze(x, axis=0)
     return x
 
 
+def _reconstruct_2d_overlap_cl(
+    patches, size, output_size, strides, padding, reduction="mean",
+    dilation_rate=1,
+):
+    pH, pW = size
+    H, W = output_size
+    sH, sW = strides
+
+    static_flat = patches.shape[-1]
+    if static_flat is None:
+        raise ValueError(
+            "For overlapping reconstruction, the last dim of `patches` "
+            "must be statically known."
+        )
+    if static_flat % (pH * pW) != 0:
+        raise ValueError(
+            f"`patches` last dim ({static_flat}) is not divisible by "
+            f"prod(size) ({pH * pW})."
+        )
+    C = static_flat // (pH * pW)
+    out_dim = pH * pW * C
+
+    kernel = backend.numpy.eye(out_dim, dtype=patches.dtype)
+    kernel = backend.numpy.reshape(kernel, (pH, pW, C, out_dim))
+
+    grid_h = patches.shape[1]
+    grid_w = patches.shape[2]
+    if grid_h is None or grid_w is None:
+        raise ValueError(
+            "For overlapping reconstruction, the patch-grid dims of "
+            "`patches` must be statically known."
+        )
+
+    if isinstance(dilation_rate, int):
+        dilation_rate = (dilation_rate, dilation_rate)
+    dH, dW = dilation_rate
+    eff_pH = (pH - 1) * dH + 1
+    eff_pW = (pW - 1) * dW + 1
+
+    if padding == "valid":
+        op_h = H - (grid_h - 1) * sH - eff_pH
+        op_w = W - (grid_w - 1) * sW - eff_pW
+        if not (0 <= op_h < sH):
+            min_valid = (grid_h - 1) * sH + eff_pH
+            raise ValueError(
+                f"output_size H={H} is inconsistent. For grid_h={grid_h}, "
+                f"stride={sH}, effective_patch={eff_pH} (patch={pH}, "
+                f"dilation={dH}), expected H in [{min_valid}, {min_valid + sH})."
+            )
+        if not (0 <= op_w < sW):
+            min_valid = (grid_w - 1) * sW + eff_pW
+            raise ValueError(
+                f"output_size W={W} is inconsistent. For grid_w={grid_w}, "
+                f"stride={sW}, effective_patch={eff_pW} (patch={pW}, "
+                f"dilation={dW}), expected W in [{min_valid}, {min_valid + sW})."
+            )
+        output_padding = (op_h, op_w)
+    else:
+        # output_padding=None lets the backend infer (avoids a TF translation
+        # bug where explicit (0,0) fails). For "same" we always crop after.
+        output_padding = None
+
+    output_sum = backend.nn.conv_transpose(
+        inputs=patches,
+        kernel=kernel,
+        strides=(sH, sW),
+        padding=padding,
+        output_padding=output_padding,
+        data_format="channels_last",
+        dilation_rate=dilation_rate,
+    )
+    if reduction == "mean":
+        counts = backend.nn.conv_transpose(
+            inputs=backend.numpy.ones_like(patches),
+            kernel=kernel,
+            strides=(sH, sW),
+            padding=padding,
+            output_padding=output_padding,
+            data_format="channels_last",
+            dilation_rate=dilation_rate,
+        )
+
+    if padding == "same":
+        cur_shape = ops.shape(output_sum)
+        cur_h, cur_w = cur_shape[1], cur_shape[2]
+        pad_total_h = cur_h - H
+        pad_total_w = cur_w - W
+        begin = [0, pad_total_h // 2, pad_total_w // 2, 0]
+        B = cur_shape[0]
+        out_shape = [B, H, W, C]
+        output_sum = ops.slice(output_sum, begin, out_shape)
+        if reduction == "mean":
+            counts = ops.slice(counts, begin, out_shape)
+
+    if reduction == "mean":
+        one = ops.cast(1, output_sum.dtype)
+        return output_sum / backend.numpy.maximum(counts, one)
+    return output_sum  # reduction == "sum"
+
+
 def _reconstruct_patches_3d(
-    patches, size, output_size, strides=None, padding="valid", data_format=None,
+    patches, size, output_size, strides=None, padding="valid",
+    data_format=None, reduction="mean", dilation_rate=1,
 ):
     if isinstance(size, int):
         size = (size, size, size)
@@ -1250,29 +1487,75 @@ def _reconstruct_patches_3d(
             "Invalid `size`. Expected length 3 for 3D reconstruction. "
             f"Got: size={size}"
         )
+    if padding not in ("same", "valid"):
+        raise ValueError(
+            f"Invalid `padding`. Expected 'same' or 'valid'. Got: {padding}"
+        )
+    strides = _normalize_strides(strides, size, "reconstruct_patches_3d")
+    if output_size is None:
+        if padding != "valid":
+            raise ValueError(
+                "`output_size=None` (auto-infer) is only supported for "
+                "padding='valid'. For padding='same', the original size is "
+                "ambiguous from patches alone — please pass output_size "
+                "explicitly."
+            )
+        output_size = _infer_output_size_valid(
+            patches, size, strides,
+            backend.standardize_data_format(data_format),
+        )
     if len(output_size) != 3:
         raise ValueError(
             "Invalid `output_size`. Expected length 3 (D, H, W). "
             f"Got: output_size={output_size}"
         )
-    if padding not in ("same", "valid"):
-        raise ValueError(
-            f"Invalid `padding`. Expected 'same' or 'valid'. Got: {padding}"
-        )
-    _validate_reconstruct_strides(size, strides, "reconstruct_patches_3d")
     data_format = backend.standardize_data_format(data_format)
+
     if data_format == "channels_first":
-        raise NotImplementedError(
-            "reconstruct_patches_3d does not yet support channels_first."
+        if len(patches.shape) == 4:    # unbatched (flat, gD, gH, gW)
+            patches_cl = backend.numpy.transpose(patches, axes=(1, 2, 3, 0))
+        elif len(patches.shape) == 5:  # batched (B, flat, gD, gH, gW)
+            patches_cl = backend.numpy.transpose(patches, axes=(0, 2, 3, 4, 1))
+        else:
+            raise ValueError(
+                f"`patches` has unexpected rank for 3D channels_first: "
+                f"got shape {patches.shape}"
+            )
+        result_cl = _reconstruct_patches_3d_cl(
+            patches_cl, size, output_size, strides, padding, reduction,
+            dilation_rate,
+        )
+        if len(patches.shape) == 4:
+            return backend.numpy.transpose(result_cl, axes=(3, 0, 1, 2))
+        return backend.numpy.transpose(result_cl, axes=(0, 4, 1, 2, 3))
+
+    return _reconstruct_patches_3d_cl(
+        patches, size, output_size, strides, padding, reduction, dilation_rate,
+    )
+
+
+def _reconstruct_patches_3d_cl(
+    patches, size, output_size, strides, padding, reduction, dilation_rate=1,
+):
+    _unbatched = (len(patches.shape) == 4)
+    if _unbatched:
+        patches = backend.numpy.expand_dims(patches, axis=0)
+
+    if _is_nonoverlapping(strides, size) and dilation_rate == 1:
+        result = _reconstruct_3d_nonoverlap_cl(patches, size, output_size, padding)
+    else:
+        result = _reconstruct_3d_overlap_cl(
+            patches, size, output_size, strides, padding, reduction, dilation_rate,
         )
 
+    if _unbatched:
+        result = backend.numpy.squeeze(result, axis=0)
+    return result
+
+
+def _reconstruct_3d_nonoverlap_cl(patches, size, output_size, padding):
     pD, pH, pW = size
     D, H, W = output_size
-
-    _unbatched = False
-    if len(patches.shape) == 4:
-        _unbatched = True
-        patches = backend.numpy.expand_dims(patches, axis=0)
 
     shp = ops.shape(patches)
     B, gD, gH, gW = shp[0], shp[1], shp[2], shp[3]
@@ -1283,8 +1566,7 @@ def _reconstruct_patches_3d(
         if static_flat % (pD * pH * pW) != 0:
             raise ValueError(
                 f"`patches` last dim ({static_flat}) is not divisible by "
-                f"prod(size) ({pD * pH * pW}). Are `size` and the patches "
-                f"tensor consistent?"
+                f"prod(size) ({pD * pH * pW})."
             )
         C = static_flat // (pD * pH * pW)
 
@@ -1296,6 +1578,108 @@ def _reconstruct_patches_3d(
         pad_total_d = gD * pD - D
         pad_total_h = gH * pH - H
         pad_total_w = gW * pW - W
+        begin = [0, pad_total_d // 2, pad_total_h // 2, pad_total_w // 2, 0]
+        out_shape = [B, D, H, W, C]
+        x = ops.slice(x, begin, out_shape)
+    else:
+        if gD * pD != D or gH * pH != H or gW * pW != W:
+            raise ValueError(
+                f"`padding='valid'` requires output_size to equal "
+                f"size * grid. Got output_size=({D},{H},{W}); for "
+                f"grid=({gD},{gH},{gW}) and size=({pD},{pH},{pW}) expected "
+                f"output_size=({gD*pD},{gH*pH},{gW*pW})."
+            )
+    return x
+
+
+def _reconstruct_3d_overlap_cl(
+    patches, size, output_size, strides, padding, reduction="mean",
+    dilation_rate=1,
+):
+    pD, pH, pW = size
+    D, H, W = output_size
+    sD, sH, sW = strides
+
+    static_flat = patches.shape[-1]
+    if static_flat is None:
+        raise ValueError(
+            "For overlapping reconstruction, the last dim of `patches` "
+            "must be statically known."
+        )
+    if static_flat % (pD * pH * pW) != 0:
+        raise ValueError(
+            f"`patches` last dim ({static_flat}) is not divisible by "
+            f"prod(size) ({pD * pH * pW})."
+        )
+    C = static_flat // (pD * pH * pW)
+    out_dim = pD * pH * pW * C
+
+    kernel = backend.numpy.eye(out_dim, dtype=patches.dtype)
+    kernel = backend.numpy.reshape(kernel, (pD, pH, pW, C, out_dim))
+
+    grid_d = patches.shape[1]
+    grid_h = patches.shape[2]
+    grid_w = patches.shape[3]
+    if grid_d is None or grid_h is None or grid_w is None:
+        raise ValueError(
+            "For overlapping reconstruction, the patch-grid dims of "
+            "`patches` must be statically known."
+        )
+
+    if isinstance(dilation_rate, int):
+        dilation_rate = (dilation_rate, dilation_rate, dilation_rate)
+    dD, dH, dW = dilation_rate
+    eff_pD = (pD - 1) * dD + 1
+    eff_pH = (pH - 1) * dH + 1
+    eff_pW = (pW - 1) * dW + 1
+
+    if padding == "valid":
+        op_d = D - (grid_d - 1) * sD - eff_pD
+        op_h = H - (grid_h - 1) * sH - eff_pH
+        op_w = W - (grid_w - 1) * sW - eff_pW
+        for label, op, stride, grid, patch, dim in (
+            ("D", op_d, sD, grid_d, eff_pD, D),
+            ("H", op_h, sH, grid_h, eff_pH, H),
+            ("W", op_w, sW, grid_w, eff_pW, W),
+        ):
+            if not (0 <= op < stride):
+                min_valid = (grid - 1) * stride + patch
+                raise ValueError(
+                    f"output_size {label}={dim} is inconsistent. For "
+                    f"grid_{label.lower()}={grid}, stride={stride}, "
+                    f"effective_patch={patch}, expected {label} in "
+                    f"[{min_valid}, {min_valid + stride})."
+                )
+        output_padding = (op_d, op_h, op_w)
+    else:
+        output_padding = None  # see 2D variant for rationale
+
+    output_sum = backend.nn.conv_transpose(
+        inputs=patches,
+        kernel=kernel,
+        strides=(sD, sH, sW),
+        padding=padding,
+        output_padding=output_padding,
+        data_format="channels_last",
+        dilation_rate=dilation_rate,
+    )
+    if reduction == "mean":
+        counts = backend.nn.conv_transpose(
+            inputs=backend.numpy.ones_like(patches),
+            kernel=kernel,
+            strides=(sD, sH, sW),
+            padding=padding,
+            output_padding=output_padding,
+            data_format="channels_last",
+            dilation_rate=dilation_rate,
+        )
+
+    if padding == "same":
+        cur_shape = ops.shape(output_sum)
+        cur_d, cur_h, cur_w = cur_shape[1], cur_shape[2], cur_shape[3]
+        pad_total_d = cur_d - D
+        pad_total_h = cur_h - H
+        pad_total_w = cur_w - W
         begin = [
             0,
             pad_total_d // 2,
@@ -1303,19 +1687,16 @@ def _reconstruct_patches_3d(
             pad_total_w // 2,
             0,
         ]
+        B = cur_shape[0]
         out_shape = [B, D, H, W, C]
-        x = ops.slice(x, begin, out_shape)
-    else:
-        if gD * pD != D or gH * pH != H or gW * pW != W:
-            raise ValueError(
-                f"`padding='valid'` requires output_size to equal "
-                f"size * grid. Got output_size=({D},{H},{W}), "
-                f"grid=({gD},{gH},{gW}), size=({pD},{pH},{pW})."
-            )
+        output_sum = ops.slice(output_sum, begin, out_shape)
+        if reduction == "mean":
+            counts = ops.slice(counts, begin, out_shape)
 
-    if _unbatched:
-        x = backend.numpy.squeeze(x, axis=0)
-    return x
+    if reduction == "mean":
+        one = ops.cast(1, output_sum.dtype)
+        return output_sum / backend.numpy.maximum(counts, one)
+    return output_sum  # reduction == "sum"
 
 
 class MapCoordinates(Operation):
