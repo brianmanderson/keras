@@ -52,6 +52,7 @@ class ReconstructPatches2D(Layer):
         strides=None,
         padding="valid",
         data_format=None,
+        reduction="mean",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -72,11 +73,20 @@ class ReconstructPatches2D(Layer):
                 f"`padding` must be 'same' or 'valid'. "
                 f"Received: padding={padding}"
             )
+        if reduction not in ("mean", "sum"):
+            raise ValueError(
+                f"`reduction` must be 'mean' or 'sum'. "
+                f"Received: reduction={reduction}"
+            )
+        # Eagerly validate strides (rejects gapped strides at construct time).
+        from keras.src.ops.image import _normalize_strides
+        _normalize_strides(strides, size, "ReconstructPatches2D")
         self.size = tuple(size)
         self.output_size = tuple(output_size)
         self.strides = strides
         self.padding = padding
         self.data_format = backend.standardize_data_format(data_format)
+        self.reduction = reduction
         self.input_spec = InputSpec(ndim=4)
 
     def call(self, patches):
@@ -87,6 +97,7 @@ class ReconstructPatches2D(Layer):
             strides=self.strides,
             padding=self.padding,
             data_format=self.data_format,
+            reduction=self.reduction,
         )
 
     def compute_output_shape(self, input_shape):
@@ -119,6 +130,7 @@ class ReconstructPatches2D(Layer):
             "strides": self.strides,
             "padding": self.padding,
             "data_format": self.data_format,
+            "reduction": self.reduction,
         }
         base_config = super().get_config()
         return {**base_config, **config}
