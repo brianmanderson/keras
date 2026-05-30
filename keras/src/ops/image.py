@@ -1236,9 +1236,23 @@ def _reconstruct_patches_2d(
     _validate_reconstruct_strides(size, strides, "reconstruct_patches")
     data_format = backend.standardize_data_format(data_format)
     if data_format == "channels_first":
-        raise NotImplementedError(
-            "reconstruct_patches does not yet support channels_first."
+        # Reconstruct in channels_last layout, then move channels back.
+        # Patches are (flat, gH, gW) unbatched or (B, flat, gH, gW) batched.
+        if len(patches.shape) == 3:
+            patches = backend.numpy.transpose(patches, axes=(1, 2, 0))
+        elif len(patches.shape) == 4:
+            patches = backend.numpy.transpose(patches, axes=(0, 2, 3, 1))
+        else:
+            raise ValueError(
+                "`patches` has unexpected rank for 2D channels_first "
+                f"reconstruction. Received shape: {patches.shape}"
+            )
+        result = _reconstruct_patches_2d(
+            patches, size, output_size, strides, padding, "channels_last"
         )
+        if len(result.shape) == 3:
+            return backend.numpy.transpose(result, axes=(2, 0, 1))
+        return backend.numpy.transpose(result, axes=(0, 3, 1, 2))
 
     pH, pW = size
     H, W = output_size
@@ -1331,9 +1345,23 @@ def _reconstruct_patches_3d(
     _validate_reconstruct_strides(size, strides, "reconstruct_patches_3d")
     data_format = backend.standardize_data_format(data_format)
     if data_format == "channels_first":
-        raise NotImplementedError(
-            "reconstruct_patches_3d does not yet support channels_first."
+        # Reconstruct in channels_last layout, then move channels back.
+        # Patches are (flat, gD, gH, gW) unbatched or (B, flat, gD, gH, gW).
+        if len(patches.shape) == 4:
+            patches = backend.numpy.transpose(patches, axes=(1, 2, 3, 0))
+        elif len(patches.shape) == 5:
+            patches = backend.numpy.transpose(patches, axes=(0, 2, 3, 4, 1))
+        else:
+            raise ValueError(
+                "`patches` has unexpected rank for 3D channels_first "
+                f"reconstruction. Received shape: {patches.shape}"
+            )
+        result = _reconstruct_patches_3d(
+            patches, size, output_size, strides, padding, "channels_last"
         )
+        if len(result.shape) == 4:
+            return backend.numpy.transpose(result, axes=(3, 0, 1, 2))
+        return backend.numpy.transpose(result, axes=(0, 4, 1, 2, 3))
 
     pD, pH, pW = size
     D, H, W = output_size

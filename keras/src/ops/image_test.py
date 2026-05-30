@@ -474,6 +474,77 @@ class ImageOpsStaticShapeTest(testing.TestCase):
         )
         self.assertEqual(out.shape, (20, 20, 20, 3))
 
+    def test_reconstruct_patches_channels_first(self):
+        # 2D channels_first batched: (B, pH*pW*C, gH, gW) -> (B, C, H, W)
+        patches = KerasTensor([2, 75, 4, 4])
+        out = kimage.reconstruct_patches(
+            patches,
+            size=(5, 5),
+            output_size=(20, 20),
+            padding="valid",
+            data_format="channels_first",
+        )
+        self.assertEqual(out.shape, (2, 3, 20, 20))
+        # 3D channels_first batched: (B, pD*pH*pW*C, gD, gH, gW)
+        patches_3d = KerasTensor([2, 375, 4, 4, 4])
+        out = kimage.reconstruct_patches_3d(
+            patches_3d,
+            size=(5, 5, 5),
+            output_size=(20, 20, 20),
+            padding="valid",
+            data_format="channels_first",
+        )
+        self.assertEqual(out.shape, (2, 3, 20, 20, 20))
+
+    def test_reconstruct_patches_channels_first_unbatched(self):
+        # Unbatched channels_first exercises the rank-3/rank-4 transpose
+        # branches in the ops (the layers always pass batched input).
+        img = np.arange(2 * 8 * 8, dtype="float32").reshape(2, 8, 8)
+        patches = kimage.extract_patches(
+            img, size=(4, 4), padding="valid", data_format="channels_first"
+        )
+        recon = kimage.reconstruct_patches(
+            patches,
+            size=(4, 4),
+            output_size=(8, 8),
+            padding="valid",
+            data_format="channels_first",
+        )
+        self.assertEqual(tuple(recon.shape), (2, 8, 8))
+        self.assertAllClose(recon, img, atol=1e-6)
+
+        vol = np.arange(2 * 6 * 6 * 6, dtype="float32").reshape(2, 6, 6, 6)
+        patches_3d = kimage.extract_patches_3d(
+            vol, size=(3, 3, 3), padding="valid", data_format="channels_first"
+        )
+        recon_3d = kimage.reconstruct_patches_3d(
+            patches_3d,
+            size=(3, 3, 3),
+            output_size=(6, 6, 6),
+            padding="valid",
+            data_format="channels_first",
+        )
+        self.assertEqual(tuple(recon_3d.shape), (2, 6, 6, 6))
+        self.assertAllClose(recon_3d, vol, atol=1e-6)
+
+    def test_reconstruct_patches_channels_first_bad_rank(self):
+        with self.assertRaisesRegex(ValueError, "unexpected rank"):
+            kimage.reconstruct_patches(
+                np.zeros((75, 4), dtype="float32"),
+                size=(5, 5),
+                output_size=(20, 20),
+                padding="valid",
+                data_format="channels_first",
+            )
+        with self.assertRaisesRegex(ValueError, "unexpected rank"):
+            kimage.reconstruct_patches_3d(
+                np.zeros((375, 4, 4), dtype="float32"),
+                size=(5, 5, 5),
+                output_size=(20, 20, 20),
+                padding="valid",
+                data_format="channels_first",
+            )
+
     def test_reconstruct_patches_output_size_not_tuple(self):
         patches = np.zeros((1, 4, 4, 75), dtype="float32")
         with self.assertRaisesRegex(TypeError, "tuple or list"):

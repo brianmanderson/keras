@@ -20,9 +20,9 @@ def _gradient_volume(D, H, W, C=1, batch=1):
 class ReconstructPatches3DTest(testing.TestCase):
     def setUp(self):
         super().setUp()
-        # The layer only supports channels_last; pin it so the suite is
-        # independent of the backend's default image_data_format (the torch
-        # CI config defaults to channels_first).
+        # Pin channels_last so tests that don't pass `data_format` explicitly
+        # are independent of the backend's default image_data_format (the
+        # torch CI config defaults to channels_first).
         self._original_data_format = backend.image_data_format()
         backend.set_image_data_format("channels_last")
 
@@ -31,52 +31,71 @@ class ReconstructPatches3DTest(testing.TestCase):
         backend.set_image_data_format(self._original_data_format)
 
     @parameterized.parameters(
-        # (D, H, W, C, size, padding)
-        (32, 64, 64, 1, (16, 32, 32), "valid"),
-        (24, 48, 48, 1, (8, 16, 16), "valid"),
-        (16, 16, 16, 2, (2, 4, 8), "valid"),
-        (25, 59, 55, 2, (16, 32, 32), "same"),
-        (17, 33, 41, 3, (4, 8, 8), "same"),
-        (5, 7, 11, 1, (3, 5, 7), "same"),
+        # (D, H, W, C, size, padding, data_format)
+        (32, 64, 64, 1, (16, 32, 32), "valid", "channels_last"),
+        (24, 48, 48, 1, (8, 16, 16), "valid", "channels_last"),
+        (16, 16, 16, 2, (2, 4, 8), "valid", "channels_last"),
+        (25, 59, 55, 2, (16, 32, 32), "same", "channels_last"),
+        (17, 33, 41, 3, (4, 8, 8), "same", "channels_last"),
+        (5, 7, 11, 1, (3, 5, 7), "same", "channels_last"),
+        # channels_first: a representative subset (transpose-sandwich around
+        # the same channels_last core), keeping the heavy cases out.
+        (16, 16, 16, 2, (2, 4, 8), "valid", "channels_first"),
+        (17, 33, 41, 3, (4, 8, 8), "same", "channels_first"),
+        (5, 7, 11, 1, (3, 5, 7), "same", "channels_first"),
     )
     def test_extract_then_reconstruct_roundtrip(
-        self, D, H, W, C, size, padding
+        self, D, H, W, C, size, padding, data_format
     ):
         x = _gradient_volume(D, H, W, C, batch=2)
         x_t = ops.convert_to_tensor(x)
-        patches = ops.image.extract_patches(x_t, size=size, padding=padding)
+        if data_format == "channels_first":
+            x_t = ops.transpose(x_t, (0, 4, 1, 2, 3))
+        patches = ops.image.extract_patches(
+            x_t, size=size, padding=padding, data_format=data_format
+        )
         layer = layers.ReconstructPatches3D(
             size=size,
             output_size=(D, H, W),
             padding=padding,
+            data_format=data_format,
         )
         recon = layer(patches)
-        self.assertEqual(tuple(recon.shape), x.shape)
-        self.assertAllClose(recon, x, atol=1e-6)
+        self.assertEqual(tuple(recon.shape), tuple(x_t.shape))
+        self.assertAllClose(recon, x_t, atol=1e-6)
 
-    def test_dynamic_spatial_dim(self):
+    @parameterized.parameters("channels_last", "channels_first")
+    def test_dynamic_spatial_dim(self, data_format):
         # patches: batch known, grid axes None, flat dim known.
         size = (4, 4, 4)
         flat = size[0] * size[1] * size[2] * 3  # C=3
-        input_layer = layers.Input(batch_shape=(1, None, None, None, flat))
+        if data_format == "channels_last":
+            input_layer = layers.Input(batch_shape=(1, None, None, None, flat))
+            expected = (1, 16, 16, 16, 3)
+        else:
+            input_layer = layers.Input(batch_shape=(1, flat, None, None, None))
+            expected = (1, 3, 16, 16, 16)
         recon = layers.ReconstructPatches3D(
             size=size,
             output_size=(16, 16, 16),
             padding="valid",
+            data_format=data_format,
         )(input_layer)
-        self.assertEqual(recon.shape, (1, 16, 16, 16, 3))
+        self.assertEqual(recon.shape, expected)
 
     def test_get_config(self):
         layer = layers.ReconstructPatches3D(
             size=(2, 3, 4),
             output_size=(10, 15, 20),
             padding="same",
+            data_format="channels_first",
         )
         config = layer.get_config()
         restored = layers.ReconstructPatches3D.from_config(config)
         self.assertEqual(restored.size, (2, 3, 4))
         self.assertEqual(restored.output_size, (10, 15, 20))
         self.assertEqual(restored.padding, "same")
+        self.assertEqual(restored.data_format, "channels_first")
 
     def test_invalid_size(self):
         with self.assertRaisesRegex(ValueError, "length 3"):
@@ -113,11 +132,3 @@ class ReconstructPatches3DTest(testing.TestCase):
                 strides=(2, 2, 2),
                 padding="valid",
             )(patches)
-
-    def test_channels_first_not_implemented(self):
-        with self.assertRaisesRegex(NotImplementedError, "channels_first"):
-            layers.ReconstructPatches3D(
-                size=(2, 2, 2),
-                output_size=(8, 8, 8),
-                data_format="channels_first",
-            )

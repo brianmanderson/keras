@@ -37,12 +37,14 @@ class ReconstructPatches2D(Layer):
             `"channels_first"`. The ordering of the dimensions in the inputs.
 
     Input shape:
-        3D tensor `(gH, gW, pH*pW*C)` or
-        4D tensor `(batch_size, gH, gW, pH*pW*C)`.
+        4D tensor. With `data_format="channels_last"`,
+        `(batch_size, gH, gW, pH*pW*C)`; with `"channels_first"`,
+        `(batch_size, pH*pW*C, gH, gW)`.
 
     Output shape:
-        3D tensor `(H, W, C)` or
-        4D tensor `(batch_size, H, W, C)`.
+        4D tensor. With `data_format="channels_last"`,
+        `(batch_size, H, W, C)`; with `"channels_first"`,
+        `(batch_size, C, H, W)`.
     """
 
     def __init__(
@@ -77,11 +79,6 @@ class ReconstructPatches2D(Layer):
         self.strides = strides
         self.padding = padding
         self.data_format = backend.standardize_data_format(data_format)
-        if self.data_format == "channels_first":
-            raise NotImplementedError(
-                "ReconstructPatches2D does not yet support "
-                "`data_format='channels_first'`."
-            )
         self.input_spec = InputSpec(ndim=4)
 
     def call(self, patches):
@@ -95,12 +92,15 @@ class ReconstructPatches2D(Layer):
         )
 
     def compute_output_shape(self, input_shape):
-        # `InputSpec(ndim=4)` and the `channels_first` check in `__init__`
-        # mean we always see a 4D, channels_last input here.
-        flat = input_shape[-1]
+        # `InputSpec(ndim=4)` means we always see a 4D (batched) input.
         patch_volume = self.size[0] * self.size[1]
+        if self.data_format == "channels_last":
+            flat = input_shape[-1]
+            channels = None if flat is None else flat // patch_volume
+            return (input_shape[0],) + self.output_size + (channels,)
+        flat = input_shape[1]
         channels = None if flat is None else flat // patch_volume
-        return (input_shape[0],) + self.output_size + (channels,)
+        return (input_shape[0], channels) + self.output_size
 
     def get_config(self):
         config = {

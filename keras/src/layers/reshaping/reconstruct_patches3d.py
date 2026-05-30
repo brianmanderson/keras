@@ -37,12 +37,14 @@ class ReconstructPatches3D(Layer):
             `"channels_first"`. The ordering of the dimensions in the inputs.
 
     Input shape:
-        4D tensor `(gD, gH, gW, pD*pH*pW*C)` or
-        5D tensor `(batch_size, gD, gH, gW, pD*pH*pW*C)`.
+        5D tensor. With `data_format="channels_last"`,
+        `(batch_size, gD, gH, gW, pD*pH*pW*C)`; with `"channels_first"`,
+        `(batch_size, pD*pH*pW*C, gD, gH, gW)`.
 
     Output shape:
-        4D tensor `(D, H, W, C)` or
-        5D tensor `(batch_size, D, H, W, C)`.
+        5D tensor. With `data_format="channels_last"`,
+        `(batch_size, D, H, W, C)`; with `"channels_first"`,
+        `(batch_size, C, D, H, W)`.
     """
 
     def __init__(
@@ -77,11 +79,6 @@ class ReconstructPatches3D(Layer):
         self.strides = strides
         self.padding = padding
         self.data_format = backend.standardize_data_format(data_format)
-        if self.data_format == "channels_first":
-            raise NotImplementedError(
-                "ReconstructPatches3D does not yet support "
-                "`data_format='channels_first'`."
-            )
         self.input_spec = InputSpec(ndim=5)
 
     def call(self, patches):
@@ -95,12 +92,15 @@ class ReconstructPatches3D(Layer):
         )
 
     def compute_output_shape(self, input_shape):
-        # `InputSpec(ndim=5)` and the `channels_first` check in `__init__`
-        # mean we always see a 5D, channels_last input here.
-        flat = input_shape[-1]
+        # `InputSpec(ndim=5)` means we always see a 5D (batched) input.
         patch_volume = self.size[0] * self.size[1] * self.size[2]
+        if self.data_format == "channels_last":
+            flat = input_shape[-1]
+            channels = None if flat is None else flat // patch_volume
+            return (input_shape[0],) + self.output_size + (channels,)
+        flat = input_shape[1]
         channels = None if flat is None else flat // patch_volume
-        return (input_shape[0],) + self.output_size + (channels,)
+        return (input_shape[0], channels) + self.output_size
 
     def get_config(self):
         config = {
