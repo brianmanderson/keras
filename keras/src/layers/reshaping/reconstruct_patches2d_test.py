@@ -81,6 +81,47 @@ class ReconstructPatches2DTest(testing.TestCase):
         )(input_layer)
         self.assertEqual(recon.shape, expected)
 
+    @parameterized.parameters("channels_last", "channels_first")
+    def test_output_size_autoinfer_valid(self, data_format):
+        # output_size omitted -> inferred from the patch grid for valid.
+        x = _gradient_image(64, 64, 3, batch=2)
+        x_t = ops.convert_to_tensor(x)
+        if data_format == "channels_first":
+            x_t = ops.transpose(x_t, (0, 3, 1, 2))
+        patches = ops.image.extract_patches(
+            x_t, size=(8, 8), padding="valid", data_format=data_format
+        )
+        layer = layers.ReconstructPatches2D(
+            size=(8, 8), padding="valid", data_format=data_format
+        )
+        recon = layer(patches)
+        self.assertEqual(tuple(recon.shape), tuple(x_t.shape))
+        self.assertAllClose(recon, x_t, atol=1e-6)
+
+    def test_autoinfer_compute_output_shape(self):
+        size = (4, 4)
+        flat = size[0] * size[1] * 3
+        inp = layers.Input(batch_shape=(2, 5, 5, flat))
+        out = layers.ReconstructPatches2D(size=size, padding="valid")(inp)
+        self.assertEqual(out.shape, (2, 20, 20, 3))
+
+    def test_autoinfer_compute_output_shape_cf_int_strides(self):
+        # channels_first auto-infer + int `strides` normalization.
+        size = (4, 4)
+        flat = size[0] * size[1] * 3
+        inp = layers.Input(batch_shape=(2, flat, 5, 5))
+        out = layers.ReconstructPatches2D(
+            size=size,
+            strides=4,
+            padding="valid",
+            data_format="channels_first",
+        )(inp)
+        self.assertEqual(out.shape, (2, 3, 20, 20))
+
+    def test_output_size_required_for_same(self):
+        with self.assertRaisesRegex(ValueError, "required when"):
+            layers.ReconstructPatches2D(size=(8, 8), padding="same")
+
     def test_get_config(self):
         layer = layers.ReconstructPatches2D(
             size=(3, 4),

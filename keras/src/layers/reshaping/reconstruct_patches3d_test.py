@@ -83,6 +83,42 @@ class ReconstructPatches3DTest(testing.TestCase):
         )(input_layer)
         self.assertEqual(recon.shape, expected)
 
+    def test_output_size_autoinfer_valid(self):
+        # output_size omitted -> inferred from the patch grid for valid.
+        x = _gradient_volume(16, 16, 16, 2, batch=2)
+        x_t = ops.convert_to_tensor(x)
+        patches = ops.image.extract_patches(
+            x_t, size=(2, 4, 8), padding="valid"
+        )
+        layer = layers.ReconstructPatches3D(size=(2, 4, 8), padding="valid")
+        recon = layer(patches)
+        self.assertEqual(tuple(recon.shape), x.shape)
+        self.assertAllClose(recon, x, atol=1e-6)
+
+    def test_autoinfer_compute_output_shape(self):
+        size = (4, 4, 4)
+        flat = size[0] * size[1] * size[2] * 3
+        inp = layers.Input(batch_shape=(2, 5, 5, 5, flat))
+        out = layers.ReconstructPatches3D(size=size, padding="valid")(inp)
+        self.assertEqual(out.shape, (2, 20, 20, 20, 3))
+
+    def test_autoinfer_compute_output_shape_cf_int_strides(self):
+        # channels_first auto-infer + int `strides` normalization.
+        size = (4, 4, 4)
+        flat = size[0] * size[1] * size[2] * 3
+        inp = layers.Input(batch_shape=(2, flat, 5, 5, 5))
+        out = layers.ReconstructPatches3D(
+            size=size,
+            strides=4,
+            padding="valid",
+            data_format="channels_first",
+        )(inp)
+        self.assertEqual(out.shape, (2, 3, 20, 20, 20))
+
+    def test_output_size_required_for_same(self):
+        with self.assertRaisesRegex(ValueError, "required when"):
+            layers.ReconstructPatches3D(size=(2, 2, 2), padding="same")
+
     def test_get_config(self):
         layer = layers.ReconstructPatches3D(
             size=(2, 3, 4),

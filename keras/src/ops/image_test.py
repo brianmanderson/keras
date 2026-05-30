@@ -496,6 +496,34 @@ class ImageOpsStaticShapeTest(testing.TestCase):
         )
         self.assertEqual(out.shape, (2, 3, 20, 20, 20))
 
+    def test_reconstruct_patches_autoinfer_valid(self):
+        # output_size omitted -> inferred from the (static) patch grid.
+        patches = KerasTensor([2, 4, 4, 75])
+        out = kimage.reconstruct_patches(patches, size=(5, 5), padding="valid")
+        self.assertEqual(out.shape, (2, 20, 20, 3))
+        patches_3d = KerasTensor([2, 4, 4, 4, 375])
+        out = kimage.reconstruct_patches_3d(
+            patches_3d, size=(5, 5, 5), padding="valid"
+        )
+        self.assertEqual(out.shape, (2, 20, 20, 20, 3))
+
+    def test_reconstruct_patches_autoinfer_dynamic_grid_symbolic(self):
+        # Dynamic grid + auto-infer -> spatial dims stay unknown (no raise).
+        patches = KerasTensor([2, None, None, 75])
+        out = kimage.reconstruct_patches(patches, size=(5, 5), padding="valid")
+        self.assertEqual(out.shape, (2, None, None, 3))
+
+    def test_reconstruct_patches_autoinfer_same_raises(self):
+        # Auto-infer is valid-only; same requires explicit output_size.
+        patches = np.zeros((2, 4, 4, 75), dtype="float32")
+        with self.assertRaisesRegex(ValueError, "only supported for"):
+            kimage.reconstruct_patches(patches, size=(5, 5), padding="same")
+        patches_3d = np.zeros((2, 4, 4, 4, 375), dtype="float32")
+        with self.assertRaisesRegex(ValueError, "only supported for"):
+            kimage.reconstruct_patches_3d(
+                patches_3d, size=(5, 5, 5), padding="same"
+            )
+
     def test_reconstruct_patches_channels_first_unbatched(self):
         # Unbatched channels_first exercises the rank-3/rank-4 transpose
         # branches in the ops (the layers always pass batched input).

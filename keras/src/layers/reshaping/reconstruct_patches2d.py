@@ -28,8 +28,10 @@ class ReconstructPatches2D(Layer):
         size: Patch size as int or tuple `(patch_height, patch_width)`,
             matching the `size` used for extraction.
         output_size: Tuple `(H, W)` — the original spatial shape before
-            extraction. Required so `"same"` padding can be unambiguously
-            inverted.
+            extraction. May be omitted (`None`) for `padding="valid"`, in
+            which case it is inferred from the patch grid; required for
+            `padding="same"`, where the original size cannot be recovered
+            from the patches alone.
         strides: Currently must equal `size` (non-overlapping). Defaults to
             `size`.
         padding: One of `"valid"` or `"same"`, matching the extraction.
@@ -50,7 +52,7 @@ class ReconstructPatches2D(Layer):
     def __init__(
         self,
         size,
-        output_size,
+        output_size=None,
         strides=None,
         padding="valid",
         data_format=None,
@@ -64,7 +66,7 @@ class ReconstructPatches2D(Layer):
                 f"`size` must be an int or a tuple of length 2. "
                 f"Received: size={size}"
             )
-        if len(output_size) != 2:
+        if output_size is not None and len(output_size) != 2:
             raise ValueError(
                 f"`output_size` must be a tuple of length 2 (H, W). "
                 f"Received: output_size={output_size}"
@@ -74,8 +76,15 @@ class ReconstructPatches2D(Layer):
                 f"`padding` must be 'same' or 'valid'. "
                 f"Received: padding={padding}"
             )
+        if output_size is None and padding == "same":
+            raise ValueError(
+                "`output_size` is required when `padding='same'`: the "
+                "original size cannot be inferred from patches alone."
+            )
         self.size = tuple(size)
-        self.output_size = tuple(output_size)
+        self.output_size = (
+            tuple(output_size) if output_size is not None else None
+        )
         self.strides = strides
         self.padding = padding
         self.data_format = backend.standardize_data_format(data_format)
@@ -94,13 +103,28 @@ class ReconstructPatches2D(Layer):
     def compute_output_shape(self, input_shape):
         # `InputSpec(ndim=4)` means we always see a 4D (batched) input.
         patch_volume = self.size[0] * self.size[1]
+        output_size = self.output_size
+        if output_size is None:
+            # Auto-infer (padding="valid"): grid spacing is the stride.
+            grid = (
+                input_shape[1:3]
+                if self.data_format == "channels_last"
+                else input_shape[2:4]
+            )
+            strides = self.strides if self.strides is not None else self.size
+            if isinstance(strides, int):
+                strides = (strides, strides)
+            output_size = tuple(
+                None if g is None else (g - 1) * s + k
+                for g, s, k in zip(grid, strides, self.size)
+            )
         if self.data_format == "channels_last":
             flat = input_shape[-1]
             channels = None if flat is None else flat // patch_volume
-            return (input_shape[0],) + self.output_size + (channels,)
+            return (input_shape[0],) + output_size + (channels,)
         flat = input_shape[1]
         channels = None if flat is None else flat // patch_volume
-        return (input_shape[0], channels) + self.output_size
+        return (input_shape[0], channels) + output_size
 
     def get_config(self):
         config = {

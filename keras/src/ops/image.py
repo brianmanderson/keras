@@ -932,7 +932,7 @@ class ReconstructPatches(Operation):
     def __init__(
         self,
         size,
-        output_size,
+        output_size=None,
         strides=None,
         padding="valid",
         data_format=None,
@@ -943,7 +943,9 @@ class ReconstructPatches(Operation):
         if isinstance(size, int):
             size = (size, size)
         self.size = tuple(size)
-        self.output_size = tuple(output_size)
+        self.output_size = (
+            tuple(output_size) if output_size is not None else None
+        )
         self.is_3d = len(self.size) == 3
         if strides is None:
             strides = self.size
@@ -979,11 +981,9 @@ class ReconstructPatches(Operation):
         if self.is_3d:
             expected_ndim_batched = 5
             expected_ndim_unbatched = 4
-            spatial = self.output_size  # (D, H, W)
         else:
             expected_ndim_batched = 4
             expected_ndim_unbatched = 3
-            spatial = self.output_size  # (H, W)
 
         if original_ndim == expected_ndim_batched:
             batch = patches_shape[0]
@@ -997,6 +997,27 @@ class ReconstructPatches(Operation):
                 f"{expected_ndim_batched} (batched). "
                 f"Received shape: {patches.shape}"
             )
+
+        # Resolve output spatial shape: use `output_size` if given, else
+        # auto-infer from the patch grid for `padding="valid"` (unknown when
+        # the grid dims are dynamic), else leave unknown.
+        if self.output_size is not None:
+            spatial = self.output_size
+        elif self.padding == "valid":
+            if self.data_format == "channels_last":
+                grid_start = 1 if batch is not None else 0
+            else:
+                grid_start = 2 if batch is not None else 1
+            grid = patches_shape[grid_start : grid_start + len(self.size)]
+            if any(g is None for g in grid):
+                spatial = (None,) * len(self.size)
+            else:
+                spatial = tuple(
+                    (g - 1) * s + k
+                    for g, s, k in zip(grid, self.strides, self.size)
+                )
+        else:
+            spatial = (None,) * len(self.size)
 
         if self.data_format == "channels_last":
             out_shape = list(spatial) + [channels_out]
@@ -1021,7 +1042,7 @@ class ReconstructPatches(Operation):
 def reconstruct_patches(
     patches,
     size,
-    output_size,
+    output_size=None,
     strides=None,
     padding="valid",
     data_format=None,
@@ -1041,8 +1062,10 @@ def reconstruct_patches(
             Length 2 tuple for 2D, length 3 tuple for 3D, or int.
         output_size: Spatial shape of the original image/volume before
             extraction. Length 2 tuple `(H, W)` for 2D, length 3 tuple
-            `(D, H, W)` for 3D. Required so that `"same"` padding can be
-            unambiguously inverted.
+            `(D, H, W)` for 3D. May be omitted (`None`) for
+            `padding="valid"`, in which case it is inferred from the patch
+            grid; required for `padding="same"`, where the original size
+            cannot be recovered from the patches alone.
         strides: Currently must equal `size` (non-overlapping). Defaults
             to `size`.
         padding: `"same"` or `"valid"`, matching the extraction.
@@ -1078,7 +1101,7 @@ def reconstruct_patches(
                 "Invalid `size` argument. Expected a tuple of length 2 or 3. "
                 f"Received: size={size} with length {len(size)}"
             )
-    if not isinstance(output_size, (tuple, list)):
+    if output_size is not None and not isinstance(output_size, (tuple, list)):
         raise TypeError(
             "Invalid `output_size` argument. Expected a tuple or list. "
             f"Received: output_size={output_size} of type "
@@ -1108,7 +1131,7 @@ def reconstruct_patches(
 def reconstruct_patches_3d(
     patches,
     size,
-    output_size,
+    output_size=None,
     strides=None,
     padding="valid",
     data_format=None,
@@ -1123,7 +1146,9 @@ def reconstruct_patches_3d(
         size: int or tuple `(patch_depth, patch_height, patch_width)`,
             matching the `size` used for extraction.
         output_size: tuple `(D, H, W)` — the original spatial shape before
-            extraction.
+            extraction. May be omitted (`None`) for `padding="valid"`, in
+            which case it is inferred from the patch grid; required for
+            `padding="same"`.
         strides: Currently must equal `size`. Defaults to `size`.
         padding: `"same"` or `"valid"`, matching the extraction.
         data_format: `"channels_last"` or `"channels_first"`.
@@ -1143,7 +1168,7 @@ def reconstruct_patches_3d(
     """
     if isinstance(size, int):
         size = (size, size, size)
-    if not isinstance(output_size, (tuple, list)):
+    if output_size is not None and not isinstance(output_size, (tuple, list)):
         raise TypeError(
             "Invalid `output_size` argument. Expected a tuple or list. "
             f"Received: output_size={output_size} of type "
@@ -1209,6 +1234,30 @@ def _validate_reconstruct_strides(size, strides, fn_name):
     return tuple(strides)
 
 
+def _infer_output_size_valid(patches, size, strides, data_format):
+    """Infer `output_size` from the patch grid for `padding='valid'`.
+
+    The forward `extract_patches` with `padding='valid'` produces a grid of
+    `g = (input - size) // stride + 1`, so the smallest input that yields
+    grid `g` is `(g - 1) * stride + size`. Requires statically-known grid
+    dims; raises otherwise so the caller can pass `output_size` explicitly.
+    """
+    rank = len(patches.shape)
+    n = len(size)
+    if data_format == "channels_last":
+        grid_start = 0 if rank == n + 1 else 1
+    else:
+        grid_start = 1 if rank == n + 1 else 2
+    grid = patches.shape[grid_start : grid_start + n]
+    if any(g is None for g in grid):
+        raise ValueError(
+            "Cannot auto-infer `output_size` for `padding='valid'`: at "
+            "least one patch-grid dimension is unknown "
+            f"(patches.shape={patches.shape}). Pass `output_size` explicitly."
+        )
+    return tuple((g - 1) * s + k for g, s, k in zip(grid, strides, size))
+
+
 def _reconstruct_patches_2d(
     patches,
     size,
@@ -1224,17 +1273,29 @@ def _reconstruct_patches_2d(
             "Invalid `size`. Expected length 2 for 2D reconstruction. "
             f"Got: size={size}"
         )
+    if padding not in ("same", "valid"):
+        raise ValueError(
+            f"Invalid `padding`. Expected 'same' or 'valid'. Got: {padding}"
+        )
+    strides = _validate_reconstruct_strides(
+        size, strides, "reconstruct_patches"
+    )
+    data_format = backend.standardize_data_format(data_format)
+    if output_size is None:
+        if padding != "valid":
+            raise ValueError(
+                "`output_size=None` (auto-infer) is only supported for "
+                "`padding='valid'`. For `padding='same'`, the original size "
+                "is ambiguous from patches alone — pass `output_size`."
+            )
+        output_size = _infer_output_size_valid(
+            patches, size, strides, data_format
+        )
     if len(output_size) != 2:
         raise ValueError(
             "Invalid `output_size`. Expected length 2 (H, W). "
             f"Got: output_size={output_size}"
         )
-    if padding not in ("same", "valid"):
-        raise ValueError(
-            f"Invalid `padding`. Expected 'same' or 'valid'. Got: {padding}"
-        )
-    _validate_reconstruct_strides(size, strides, "reconstruct_patches")
-    data_format = backend.standardize_data_format(data_format)
     if data_format == "channels_first":
         # Reconstruct in channels_last layout, then move channels back.
         # Patches are (flat, gH, gW) unbatched or (B, flat, gH, gW) batched.
@@ -1333,17 +1394,29 @@ def _reconstruct_patches_3d(
             "Invalid `size`. Expected length 3 for 3D reconstruction. "
             f"Got: size={size}"
         )
+    if padding not in ("same", "valid"):
+        raise ValueError(
+            f"Invalid `padding`. Expected 'same' or 'valid'. Got: {padding}"
+        )
+    strides = _validate_reconstruct_strides(
+        size, strides, "reconstruct_patches_3d"
+    )
+    data_format = backend.standardize_data_format(data_format)
+    if output_size is None:
+        if padding != "valid":
+            raise ValueError(
+                "`output_size=None` (auto-infer) is only supported for "
+                "`padding='valid'`. For `padding='same'`, the original size "
+                "is ambiguous from patches alone — pass `output_size`."
+            )
+        output_size = _infer_output_size_valid(
+            patches, size, strides, data_format
+        )
     if len(output_size) != 3:
         raise ValueError(
             "Invalid `output_size`. Expected length 3 (D, H, W). "
             f"Got: output_size={output_size}"
         )
-    if padding not in ("same", "valid"):
-        raise ValueError(
-            f"Invalid `padding`. Expected 'same' or 'valid'. Got: {padding}"
-        )
-    _validate_reconstruct_strides(size, strides, "reconstruct_patches_3d")
-    data_format = backend.standardize_data_format(data_format)
     if data_format == "channels_first":
         # Reconstruct in channels_last layout, then move channels back.
         # Patches are (flat, gD, gH, gW) unbatched or (B, flat, gD, gH, gW).
