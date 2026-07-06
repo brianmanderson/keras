@@ -27,21 +27,21 @@ class ReconstructPatches2D(Layer):
     Args:
         size: Patch size as int or tuple `(patch_height, patch_width)`,
             matching the `size` used for extraction.
-        output_size: Tuple `(H, W)` — the original spatial shape before
-            extraction. Required so `"same"` padding can be unambiguously
-            inverted.
+        output_size: Tuple `(H, W)`. With `padding="valid"` this must
+            equal `grid * size` (the region covered by the patches, i.e.
+            the original size cropped down to a multiple of `size`); with
+            `padding="same"`, the original spatial shape before extraction.
         strides: Currently must equal `size` (non-overlapping). Defaults to
             `size`.
         padding: One of `"valid"` or `"same"`, matching the extraction.
-        data_format: A string, one of `"channels_last"` (default) or
-            `"channels_first"`. The ordering of the dimensions in the inputs.
+        data_format: A string, the ordering of the dimensions in the
+            inputs. Only `"channels_last"` is currently supported;
+            `"channels_first"` raises a `NotImplementedError`.
 
     Input shape:
-        3D tensor `(gH, gW, pH*pW*C)` or
         4D tensor `(batch_size, gH, gW, pH*pW*C)`.
 
     Output shape:
-        3D tensor `(H, W, C)` or
         4D tensor `(batch_size, H, W, C)`.
     """
 
@@ -61,6 +61,12 @@ class ReconstructPatches2D(Layer):
             raise ValueError(
                 f"`size` must be an int or a tuple of length 2. "
                 f"Received: size={size}"
+            )
+        if not isinstance(output_size, (tuple, list)):
+            raise TypeError(
+                "`output_size` must be a tuple or list of length 2 (H, W). "
+                f"Received: output_size={output_size} of type "
+                f"{type(output_size).__name__}"
             )
         if len(output_size) != 2:
             raise ValueError(

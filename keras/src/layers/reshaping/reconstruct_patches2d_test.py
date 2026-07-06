@@ -74,6 +74,18 @@ class ReconstructPatches2DTest(testing.TestCase):
         self.assertEqual(restored.output_size, (12, 16))
         self.assertEqual(restored.padding, "valid")
 
+    def test_layer_behaviors(self):
+        self.run_layer_test(
+            layers.ReconstructPatches2D,
+            init_kwargs={
+                "size": (4, 4),
+                "output_size": (16, 16),
+                "padding": "valid",
+            },
+            input_shape=(2, 4, 4, 48),
+            expected_output_shape=(2, 16, 16, 3),
+        )
+
     def test_invalid_size(self):
         with self.assertRaisesRegex(ValueError, "length 2"):
             layers.ReconstructPatches2D(size=(2, 3, 4), output_size=(10, 15))
@@ -86,6 +98,25 @@ class ReconstructPatches2DTest(testing.TestCase):
     def test_invalid_output_size(self):
         with self.assertRaisesRegex(ValueError, "length 2"):
             layers.ReconstructPatches2D(size=(2, 2), output_size=(8, 8, 8))
+
+    def test_invalid_output_size_type(self):
+        with self.assertRaisesRegex(TypeError, "tuple or list"):
+            layers.ReconstructPatches2D(size=(4, 4), output_size=16)
+
+    def test_strides_overlap_not_implemented(self):
+        x = _gradient_image(16, 16, 1, batch=1)
+        patches = ops.image.extract_patches(
+            ops.convert_to_tensor(x),
+            size=(4, 4),
+            padding="valid",
+        )
+        with self.assertRaisesRegex(NotImplementedError, "non-overlapping"):
+            layers.ReconstructPatches2D(
+                size=(4, 4),
+                output_size=(16, 16),
+                strides=(2, 2),
+                padding="valid",
+            )(patches)
 
     def test_invalid_padding(self):
         with self.assertRaisesRegex(ValueError, "'same' or 'valid'"):

@@ -78,6 +78,18 @@ class ReconstructPatches3DTest(testing.TestCase):
         self.assertEqual(restored.output_size, (10, 15, 20))
         self.assertEqual(restored.padding, "same")
 
+    def test_layer_behaviors(self):
+        self.run_layer_test(
+            layers.ReconstructPatches3D,
+            init_kwargs={
+                "size": (2, 2, 2),
+                "output_size": (8, 8, 8),
+                "padding": "valid",
+            },
+            input_shape=(2, 4, 4, 4, 24),
+            expected_output_shape=(2, 8, 8, 8, 3),
+        )
+
     def test_invalid_size(self):
         with self.assertRaisesRegex(ValueError, "length 3"):
             layers.ReconstructPatches3D(size=(2, 3), output_size=(10, 15, 20))
@@ -90,6 +102,10 @@ class ReconstructPatches3DTest(testing.TestCase):
     def test_invalid_output_size(self):
         with self.assertRaisesRegex(ValueError, "length 3"):
             layers.ReconstructPatches3D(size=(2, 2, 2), output_size=(8, 8))
+
+    def test_invalid_output_size_type(self):
+        with self.assertRaisesRegex(TypeError, "tuple or list"):
+            layers.ReconstructPatches3D(size=(2, 2, 2), output_size=8)
 
     def test_invalid_padding(self):
         with self.assertRaisesRegex(ValueError, "'same' or 'valid'"):
